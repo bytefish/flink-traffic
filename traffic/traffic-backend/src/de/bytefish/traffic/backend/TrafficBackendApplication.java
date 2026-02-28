@@ -1,16 +1,23 @@
 package de.bytefish.traffic.backend;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import de.bytefish.traffic.shared.TelemetryEvent;
 import io.nats.client.*;
-import io.nats.client.api.StreamConfiguration;
+import io.nats.client.JetStreamManagement;
 import io.nats.client.api.StorageType;
+import io.nats.client.api.StreamConfiguration;
+import io.synadia.flink.message.SourceConverter;
+import io.synadia.flink.source.NatsSource;
+import io.synadia.flink.source.NatsSourceBuilder;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.RichMapFunction;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.sink2.Sink;
+import org.apache.flink.api.connector.sink2.SinkWriter;
+import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
-import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
-import org.apache.flink.streaming.api.windowing.time.Time;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
@@ -20,10 +27,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.bind.annotation.*;
 
 import jakarta.annotation.PostConstruct;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -37,7 +46,6 @@ public class TrafficBackendApplication {
 // ============================================================================
 // DATENMODELLE
 // ============================================================================
-record TelemetryEvent(String vehicleId, double lat, double lon, String h3_12, double speed, double heading) {}
 record TrafficFlowResult(String h3_12, String directionBucket, double avgSpeed, double baselineSpeed, double congestionIndex, int vehicleCount, String trafficState) {}
 record RawAggregation(String h3, String direction, double avgSpeed, int count) {}
 
@@ -65,14 +73,11 @@ class NatsConfig {
 }
 
 // ============================================================================
-// HISTORICAL STORE (V85 Berechnung & Minimum Observations)
+// HISTORICAL STORE
 // ============================================================================
 @Service
 class HistoricalSpeedStore {
-    // In Produktion: Eine Redis-DB oder PostgreSQL, gefüllt durch nächtliche Batch-Jobs
     private final Map<String, List<Double>> speedObservations = new ConcurrentHashMap<>();
-    
-    // Für die Simulation setzen wir das Limit auf 30 Autos, bevor eine Baseline gültig ist.
     private static final int MIN_OBSERVATIONS = 30;
 
     public void observeAndLearnSpeed(String h3_12, double heading, double speed) {
@@ -85,17 +90,15 @@ class HistoricalSpeedStore {
         List<Double> observations = speedObservations.get(key);
 
         if (observations == null || observations.size() < MIN_OBSERVATIONS) {
-            return -1.0; // Noch nicht genug Daten gesammelt
+            return -1.0;
         }
 
-        // Berechne das 85-Perzentil (V85)
         List<Double> sorted = new java.util.ArrayList<>(observations);
         Collections.sort(sorted);
-        
         int index85 = (int) Math.ceil(0.85 * sorted.size()) - 1;
         return sorted.get(Math.max(0, index85));
     }
-    
+
     public int getObservationCount(String h3_12, String directionBucket) {
         List<Double> obs = speedObservations.get(h3_12 + "_" + directionBucket);
         return obs != null ? obs.size() : 0;
@@ -110,8 +113,8 @@ class TrafficStateStore {
     }
     public TrafficFlowResult getState(String h3_12, double heading) {
         String bucket = DirectionHelper.getBucket(heading);
-        return currentState.getOrDefault(h3_12 + "_" + bucket, 
-            new TrafficFlowResult(h3_12, bucket, -1, -1, -1, 0, "UNKNOWN"));
+        return currentState.getOrDefault(h3_12 + "_" + bucket,
+                new TrafficFlowResult(h3_12, bucket, -1, -1, -1, 0, "UNKNOWN"));
     }
 }
 
@@ -142,7 +145,7 @@ class TrafficController {
 }
 
 // ============================================================================
-// APACHE FLINK JOB 
+// APACHE FLINK 2.0 JOB & LOGIK
 // ============================================================================
 @Service
 class FlinkJobManager {
@@ -159,16 +162,47 @@ class FlinkJobManager {
         new Thread(() -> {
             try {
                 StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
-                
-                env.addSource(new NatsTelemetrySource())
-                   .map(event -> new FlinkProcessingEvent(event.h3_12(), DirectionHelper.getBucket(event.heading()), event.speed()))
-                   .keyBy(event -> event.h3 + "_" + event.directionBucket)
-                   .window(TumblingProcessingTimeWindows.of(Time.seconds(5)))
-                   .aggregate(new TrafficAggregator())
-                   .map(new CongestionEnricher(historicalStore))
-                   .addSink(new LocalStateSink(stateStore, historicalStore));
 
-                env.execute("Smart H3 Traffic Detection");
+                Properties natsProps = new Properties();
+
+                // NATS Properties
+                natsProps.setProperty(Options.PROP_URL, "nats://localhost:4222");
+
+                SourceConverter<TelemetryEvent> converter = new SourceConverter<TelemetryEvent>() {
+                    private final ObjectMapper mapper = new ObjectMapper();
+
+                    @Override
+                    public TelemetryEvent convert(Message message) {
+                        try {
+                            //Parses the JSON Data off of the Event
+                            return mapper.readValue(message.getData(), TelemetryEvent.class);
+                        } catch (IOException e) {
+                            throw new RuntimeException("Error deserializing the TelemetryEvent", e);
+                        }
+                    }
+
+                    @Override
+                    public TypeInformation<TelemetryEvent> getProducedType() {
+                        return TypeInformation.of(TelemetryEvent.class);
+                    }
+                };
+
+                NatsSource<TelemetryEvent> natsSource = new NatsSourceBuilder<TelemetryEvent>()
+                        .connectionProperties(natsProps)
+                        .subjects("telemetry.>")
+                        .sourceConverter(converter)
+                        .build();
+
+                // Flink 2.0 Pipeline
+                env.fromSource(natsSource, WatermarkStrategy.noWatermarks(), "Synadia NATS Source")
+                        .map(event -> new FlinkProcessingEvent(event.h3_12(), DirectionHelper.getBucket(event.heading()), event.speed()))
+                        .keyBy(event -> event.h3 + "_" + event.directionBucket)
+                        .window(TumblingProcessingTimeWindows.of(Duration.ofSeconds(5)))
+                        .aggregate(new TrafficAggregator())
+                        .map(new CongestionEnricher(historicalStore))
+                        .sinkTo(new LocalStateSink(stateStore, historicalStore));
+
+                env.execute("Smart H3 Traffic Detection (Synadia Flink 2.0)");
             } catch (Exception e) {
                 e.printStackTrace();
             }
@@ -196,16 +230,23 @@ class TrafficAccumulator {
 }
 
 class TrafficAggregator implements AggregateFunction<FlinkProcessingEvent, TrafficAccumulator, RawAggregation> {
-    @Override public TrafficAccumulator createAccumulator() { return new TrafficAccumulator(); }
+    @Override public TrafficAccumulator createAccumulator() {
+        return new TrafficAccumulator();
+    }
+
     @Override public TrafficAccumulator add(FlinkProcessingEvent value, TrafficAccumulator acc) {
         acc.h3 = value.h3; acc.directionBucket = value.directionBucket;
         acc.sumSpeed += value.speed; acc.count += 1;
         return acc;
     }
+
     @Override public RawAggregation getResult(TrafficAccumulator acc) {
         return new RawAggregation(acc.h3, acc.directionBucket, acc.sumSpeed / acc.count, acc.count);
     }
-    @Override public TrafficAccumulator merge(TrafficAccumulator a, TrafficAccumulator b) { return null; }
+
+    @Override public TrafficAccumulator merge(TrafficAccumulator a, TrafficAccumulator b) {
+        return null;
+    }
 }
 
 class CongestionEnricher extends RichMapFunction<RawAggregation, TrafficFlowResult> {
@@ -223,52 +264,35 @@ class CongestionEnricher extends RichMapFunction<RawAggregation, TrafficFlowResu
             if (congestionIndex < 0.40) state = "HEAVY_JAM";
             else if (congestionIndex < 0.75) state = "SLOW_TRAFFIC";
         } else if (baseline <= 0) {
-            state = "GATHERING_DATA"; // Noch nicht genug historische Daten für eine verlässliche Aussage
+            state = "GATHERING_DATA";
         } else if (raw.count() < 2) {
-            state = "UNKNOWN (Zu wenig Live-Daten)";
+            state = "UNKNOWN (Not enough Live-Data)";
         }
 
         return new TrafficFlowResult(raw.h3(), raw.direction(), Math.round(raw.avgSpeed() * 10.0)/10.0, Math.round(baseline * 10.0)/10.0, Math.round(congestionIndex * 100.0)/100.0, raw.count(), state);
     }
 }
 
-class NatsTelemetrySource extends RichSourceFunction<TelemetryEvent> {
-    private volatile boolean isRunning = true;
-    private transient Connection nc;
-    private transient JetStreamSubscription sub;
-    private transient ObjectMapper mapper;
-
-    @Override
-    public void open(org.apache.flink.configuration.Configuration parameters) throws Exception {
-        nc = Nats.connect("nats://localhost:4222");
-        mapper = new ObjectMapper();
-        PullSubscribeOptions pullOptions = PullSubscribeOptions.builder().stream("TELEMETRY").build();
-        sub = nc.jetStream().subscribe("telemetry.>", pullOptions);
-    }
-
-    @Override
-    public void run(SourceContext<TelemetryEvent> ctx) throws Exception {
-        while (isRunning) {
-            List<Message> messages = sub.fetch(100, Duration.ofMillis(500));
-            for (Message msg : messages) {
-                ctx.collect(mapper.readValue(msg.getData(), TelemetryEvent.class));
-                msg.ack();
-            }
-        }
-    }
-    @Override public void cancel() { isRunning = false; try { if(nc!=null)nc.close(); }catch(Exception e){} }
-}
-
-class LocalStateSink extends RichSinkFunction<TrafficFlowResult> {
+class LocalStateSink implements Sink<TrafficFlowResult> {
     private final TrafficStateStore store;
     private final HistoricalSpeedStore histStore;
-    public LocalStateSink(TrafficStateStore store, HistoricalSpeedStore histStore) { this.store = store; this.histStore = histStore; }
+
+    public LocalStateSink(TrafficStateStore store, HistoricalSpeedStore histStore) {
+        this.store = store; this.histStore = histStore;
+    }
 
     @Override
-    public void invoke(TrafficFlowResult value, Context context) {
-        int histCount = histStore.getObservationCount(value.h3_12(), value.directionBucket());
-        System.out.printf("[FLINK SINK] H3: %s | Ø-Live: %5.1f km/h | Baseline: %5.1f km/h (aus %d Messungen) | Index: %5.2f | Status: %s%n",
-                value.h3_12(), value.avgSpeed(), value.baselineSpeed(), histCount, value.congestionIndex(), value.trafficState());
-        store.updateState(value);
+    public SinkWriter<TrafficFlowResult> createWriter(WriterInitContext context) throws IOException {
+        return new SinkWriter<>() {
+            @Override
+            public void write(TrafficFlowResult value, Context ctx) {
+                int histCount = histStore.getObservationCount(value.h3_12(), value.directionBucket());
+                System.out.printf("[SINK] H3: %s | Ø-Live: %5.1f km/h | Baseline: %5.1f km/h (of %d Measurements) | Index: %5.2f | Status: %s%n",
+                        value.h3_12(), value.avgSpeed(), value.baselineSpeed(), histCount, value.congestionIndex(), value.trafficState());
+                store.updateState(value);
+            }
+            @Override public void flush(boolean endOfInput) {}
+            @Override public void close() {}
+        };
     }
 }

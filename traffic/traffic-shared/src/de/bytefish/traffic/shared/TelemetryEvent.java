@@ -1,3 +1,3 @@
+package de.bytefish.traffic.shared;
 
-
-record TelemetryEvent(String vehicleId, double lat, double lon, String h3_12, double speed, double heading) {}
+public record TelemetryEvent(String vehicleId, double lat, double lon, String h3_12, double speed, double heading) {}

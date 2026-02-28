@@ -1,7 +1,8 @@
-package de.bytefish.simulator;
+package de.bytefish.traffic.simulator;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.uber.h3core.H3Core;
-import java.io.IOException;
+import de.bytefish.traffic.shared.TelemetryEvent;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -16,14 +17,15 @@ import java.util.Set;
 public class TrafficSimulatorConsole {
 
     private static final String BACKEND_URL = "http://localhost:8080/api/traffic/telemetry";
-    
     private static final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
-            
     private static final Random random = new Random();
 
-    // A single high-resolution point on the route
+    // Jackson ObjectMapper für die saubere JSON-Serialisierung
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    // Ein einzelner hochauflösender Punkt auf der Route
     record RoutePoint(String h3, double lat, double lon, double distanceMetersFromStart) {}
 
     public static void main(String[] args) throws Exception {
@@ -41,7 +43,7 @@ public class TrafficSimulatorConsole {
 
         System.out.println("-> Generating high-resolution route...");
         List<RoutePoint> route = generateContinuousRoute(h3, startLat, startLon, endLat, endLon, 12);
-        
+
         System.out.println("-> Route generated! Length: " + Math.round(route.get(route.size()-1).distanceMetersFromStart() / 1000.0) + " km");
         System.out.println("-> Number of unique 9-meter H3 cells on this route: " + route.size());
 
@@ -52,10 +54,10 @@ public class TrafficSimulatorConsole {
         // PHASE 1: Learning Phase (The entire route learns "Free Flow")
         // -----------------------------------------------------------------
         System.out.println("\n[Phase 1] Collecting historical data for all " + route.size() + " cells (130 km/h baseline)...");
-        
+
         for (int cellIndex = 0; cellIndex < route.size(); cellIndex++) {
             RoutePoint pt = route.get(cellIndex);
-            
+
             // Progress bar in the console to show progress
             if (cellIndex % 50 == 0) System.out.print(".");
 
@@ -79,11 +81,11 @@ public class TrafficSimulatorConsole {
 
         for (int cellIndex = 0; cellIndex < route.size(); cellIndex++) {
             RoutePoint pt = route.get(cellIndex);
-            
+
             // Determine speed based on position (distance from start)
             double targetSpeed;
             boolean inJam = pt.distanceMetersFromStart() >= jamStartMeters && pt.distanceMetersFromStart() <= jamEndMeters;
-            
+
             if (inJam) {
                 targetSpeed = 25.0; // Traffic jam!
             } else if (pt.distanceMetersFromStart() > jamEndMeters && pt.distanceMetersFromStart() < jamEndMeters + 2000) {
@@ -95,10 +97,10 @@ public class TrafficSimulatorConsole {
             for (int i = 0; i < liveCars; i++) {
                 double stdDeviation = targetSpeed < 50 ? 3.0 : 8.0;
                 double speed = targetSpeed + (random.nextGaussian() * stdDeviation);
-                speed = Math.max(0.0, speed); 
-                
+                speed = Math.max(0.0, speed);
+
                 String response = sendTelemetry("Live_Car_" + i, pt.h3(), pt.lat(), pt.lon(), speed, headingMuenster);
-                
+
                 // We only log every 100th cell or the exact traffic jam transition to avoid spam
                 if (i == liveCars - 1) {
                     if (cellIndex % 100 == 0 || Math.abs(pt.distanceMetersFromStart() - jamStartMeters) < 20 || Math.abs(pt.distanceMetersFromStart() - jamEndMeters) < 20) {
@@ -114,7 +116,7 @@ public class TrafficSimulatorConsole {
     }
 
     /**
-     * Calculates a continuous line between two GPS points and determines all 
+     * Calculates a continuous line between two GPS points and determines all
      * H3 cells that lie on this line.
      */
     private static List<RoutePoint> generateContinuousRoute(H3Core h3, double lat1, double lon1, double lat2, double lon2, int resolution) {
@@ -158,23 +160,24 @@ public class TrafficSimulatorConsole {
     }
 
     private static String sendTelemetry(String vid, String h3, double lat, double lon, double speed, double heading) {
-        speed = Math.round(speed * 10.0) / 10.0;
-        String jsonPayload = String.format(
-                "{\"vehicleId\":\"%s\", \"lat\":%s, \"lon\":%s, \"h3_12\":\"%s\", \"speed\":%s, \"heading\":%s}",
-                vid, lat, lon, h3, speed, heading
-        );
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(BACKEND_URL))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
-                .build();
+        speed = Math.round(speed * 10.0) / 10.0;
+
+        TelemetryEvent event = new TelemetryEvent(vid, lat, lon, h3, speed, heading);
 
         try {
+            String jsonPayload = objectMapper.writeValueAsString(event);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(BACKEND_URL))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
+                    .build();
+
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             return response.body();
         } catch (Exception e) {
-            return "ERROR";
+            return "ERROR: " + e.getMessage();
         }
     }
 }
