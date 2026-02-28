@@ -1,0 +1,50 @@
+1. Create a Root Certificate Authority (CA)
+Generate the CA Private Key (ca-key.pem):
+
+This generates a 4096-bit key and will prompt you for a passphrase to encrypt it.
+
+Bash
+
+openssl genrsa -out ca-key.pem 4096
+Generate the CA Certificate (ca.pem):
+
+You'll need to enter the passphrase you set above.
+
+Bash
+
+openssl req -new -x509 -days 3650 -key ca-key.pem -out ca.pem -subj "/CN=NATS Test CA/O=Test Organization/C=US"
+2. Create the NATS Server Certificate
+Generate the Server Private Key (server-key.pem):
+
+To keep the key unencrypted (which NATS requires), you need to use the -out flag followed by the key size, and NOT the arguments that were causing the errors.
+
+Bash
+
+openssl genrsa -out server-key.pem 2048
+Note: The output key will be unencrypted by default when used this way, which is what the server needs.
+
+Create a Certificate Signing Request (CSR):
+
+Bash
+
+openssl req -new -key server-key.pem -out server.csr -subj "/CN=localhost/O=Test Organization/C=US"
+Create the X.509 Extension File (server-ext.cnf): (No change to this file)
+
+Ini, TOML
+
+# server-ext.cnf
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = nats-server
+Sign the Server Certificate (server.pem):
+
+You'll need to enter the passphrase for the CA key (ca-key.pem).
+
+Bash
+
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out server.pem -days 365 -sha256 -extfile server-ext.cnf
