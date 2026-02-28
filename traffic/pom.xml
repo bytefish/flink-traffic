@@ -12,7 +12,7 @@
     <modules>
         <module>traffic-shared</module>
         <module>traffic-backend</module>
-        <module>traffic-simulation</module>
+        <module>traffic-simulator</module>
     </modules>
 
     <properties>

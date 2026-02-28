@@ -7,8 +7,8 @@
         <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
         <outputRelativeToContentRoot value="true" />
         <module name="traffic-shared" />
-        <module name="traffic-simulator" />
         <module name="traffic-backend" />
+        <module name="traffic-simulator" />
       </profile>
     </annotationProcessing>
   </component>

@@ -1,4 +1,4 @@
-package com.verkehr.simulator;
+package de.bytefish.simulator;
 
 import com.uber.h3core.H3Core;
 import java.io.IOException;

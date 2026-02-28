@@ -1,4 +1,4 @@
-package com.verkehr.backend;
+package de.bytefish.traffic.backend;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.nats.client.*;
