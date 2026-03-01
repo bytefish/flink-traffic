@@ -1,11 +1,9 @@
 package de.bytefish.traffic.backend;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import de.bytefish.traffic.shared.TelemetryEvent;
 import io.nats.client.*;
-import io.nats.client.JetStreamManagement;
-import io.nats.client.api.StorageType;
 import io.nats.client.api.StreamConfiguration;
+import io.nats.client.api.StorageType;
 import io.synadia.flink.message.SourceConverter;
 import io.synadia.flink.source.NatsSource;
 import io.synadia.flink.source.NatsSourceBuilder;
@@ -22,9 +20,9 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
 
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
@@ -44,13 +42,14 @@ public class TrafficBackendApplication {
 }
 
 // ============================================================================
-// DATENMODELLE
+// DATA MODELS
 // ============================================================================
+record TelemetryEvent(String vehicleId, double lat, double lon, String h3_12, double speed, double heading) {}
 record TrafficFlowResult(String h3_12, String directionBucket, double avgSpeed, double baselineSpeed, double congestionIndex, int vehicleCount, String trafficState) {}
 record RawAggregation(String h3, String direction, double avgSpeed, int count) {}
 
 // ============================================================================
-// NATS KONFIGURATION
+// NATS CONFIGURATION
 // ============================================================================
 @Configuration
 class NatsConfig {
@@ -119,33 +118,45 @@ class TrafficStateStore {
 }
 
 // ============================================================================
-// REST API
+// HIGH-PERFORMANCE REACTIVE REST API (WEBFLUX)
 // ============================================================================
 @RestController
 @RequestMapping("/api/traffic")
 class TrafficController {
-    private final Connection nc;
+    private final JetStream js;
     private final ObjectMapper mapper;
     private final TrafficStateStore stateStore;
     private final HistoricalSpeedStore historicalStore;
 
-    public TrafficController(Connection nc, TrafficStateStore stateStore, HistoricalSpeedStore historicalStore) {
-        this.nc = nc;
+    public TrafficController(Connection nc, TrafficStateStore stateStore, HistoricalSpeedStore historicalStore) throws IOException {
+        this.js = nc.jetStream(); // Cache JetStream instance for performance
         this.stateStore = stateStore;
         this.historicalStore = historicalStore;
         this.mapper = new ObjectMapper();
     }
 
+    /**
+     * Fully reactive, non-blocking endpoint with zero-serialization overhead for NATS.
+     */
     @PostMapping("/telemetry")
-    public ResponseEntity<TrafficFlowResult> receiveTelemetry(@RequestBody TelemetryEvent event) throws Exception {
-        historicalStore.observeAndLearnSpeed(event.h3_12(), event.heading(), event.speed());
-        nc.jetStream().publish("telemetry.v1", mapper.writeValueAsBytes(event));
-        return ResponseEntity.ok(stateStore.getState(event.h3_12(), event.heading()));
+    public Mono<TrafficFlowResult> receiveTelemetry(@RequestBody byte[] rawPayload) {
+        return Mono.fromCallable(() -> {
+            // 1. FAST DESERIALIZATION: Parse the raw bytes directly into the record
+            return mapper.readValue(rawPayload, TelemetryEvent.class);
+        }).flatMap(event -> {
+            // 2. Update memory store
+            historicalStore.observeAndLearnSpeed(event.h3_12(), event.heading(), event.speed());
+
+            // 3. ZERO-COPY ROUTING: Push the *exact original bytes* to NATS.
+            // publishAsync returns a CompletableFuture, which perfectly integrates into WebFlux Mono.
+            return Mono.fromFuture(js.publishAsync("telemetry.v1", rawPayload))
+                    .map(ack -> stateStore.getState(event.h3_12(), event.heading()));
+        });
     }
 }
 
 // ============================================================================
-// APACHE FLINK 2.0 JOB & LOGIK
+// APACHE FLINK 2.0 JOB & LOGIC
 // ============================================================================
 @Service
 class FlinkJobManager {
@@ -164,23 +175,18 @@ class FlinkJobManager {
                 StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
 
                 Properties natsProps = new Properties();
-
-                // NATS Properties
                 natsProps.setProperty(Options.PROP_URL, "nats://localhost:4222");
 
                 SourceConverter<TelemetryEvent> converter = new SourceConverter<TelemetryEvent>() {
                     private final ObjectMapper mapper = new ObjectMapper();
-
                     @Override
                     public TelemetryEvent convert(Message message) {
                         try {
-                            //Parses the JSON Data off of the Event
                             return mapper.readValue(message.getData(), TelemetryEvent.class);
                         } catch (IOException e) {
-                            throw new RuntimeException("Error deserializing the TelemetryEvent", e);
+                            throw new RuntimeException("Error deserializing TelemetryEvent", e);
                         }
                     }
-
                     @Override
                     public TypeInformation<TelemetryEvent> getProducedType() {
                         return TypeInformation.of(TelemetryEvent.class);
@@ -193,7 +199,6 @@ class FlinkJobManager {
                         .sourceConverter(converter)
                         .build();
 
-                // Flink 2.0 Pipeline
                 env.fromSource(natsSource, WatermarkStrategy.noWatermarks(), "Synadia NATS Source")
                         .map(event -> new FlinkProcessingEvent(event.h3_12(), DirectionHelper.getBucket(event.heading()), event.speed()))
                         .keyBy(event -> event.h3 + "_" + event.directionBucket)
@@ -202,7 +207,7 @@ class FlinkJobManager {
                         .map(new CongestionEnricher(historicalStore))
                         .sinkTo(new LocalStateSink(stateStore, historicalStore));
 
-                env.execute("Smart H3 Traffic Detection (Synadia Flink 2.0)");
+                env.execute("Smart H3 Traffic Detection (Reactive Backend)");
             } catch (Exception e) {
                 e.printStackTrace();
             }
@@ -230,23 +235,16 @@ class TrafficAccumulator {
 }
 
 class TrafficAggregator implements AggregateFunction<FlinkProcessingEvent, TrafficAccumulator, RawAggregation> {
-    @Override public TrafficAccumulator createAccumulator() {
-        return new TrafficAccumulator();
-    }
-
+    @Override public TrafficAccumulator createAccumulator() { return new TrafficAccumulator(); }
     @Override public TrafficAccumulator add(FlinkProcessingEvent value, TrafficAccumulator acc) {
         acc.h3 = value.h3; acc.directionBucket = value.directionBucket;
         acc.sumSpeed += value.speed; acc.count += 1;
         return acc;
     }
-
     @Override public RawAggregation getResult(TrafficAccumulator acc) {
         return new RawAggregation(acc.h3, acc.directionBucket, acc.sumSpeed / acc.count, acc.count);
     }
-
-    @Override public TrafficAccumulator merge(TrafficAccumulator a, TrafficAccumulator b) {
-        return null;
-    }
+    @Override public TrafficAccumulator merge(TrafficAccumulator a, TrafficAccumulator b) { return null; }
 }
 
 class CongestionEnricher extends RichMapFunction<RawAggregation, TrafficFlowResult> {
@@ -266,13 +264,16 @@ class CongestionEnricher extends RichMapFunction<RawAggregation, TrafficFlowResu
         } else if (baseline <= 0) {
             state = "GATHERING_DATA";
         } else if (raw.count() < 2) {
-            state = "UNKNOWN (Not enough Live-Data)";
+            state = "UNKNOWN (Not enough live data)";
         }
 
         return new TrafficFlowResult(raw.h3(), raw.direction(), Math.round(raw.avgSpeed() * 10.0)/10.0, Math.round(baseline * 10.0)/10.0, Math.round(congestionIndex * 100.0)/100.0, raw.count(), state);
     }
 }
 
+// ============================================================================
+// FLINK 2.0 SINK (FLIP-191 API)
+// ============================================================================
 class LocalStateSink implements Sink<TrafficFlowResult> {
     private final TrafficStateStore store;
     private final HistoricalSpeedStore histStore;
@@ -287,7 +288,7 @@ class LocalStateSink implements Sink<TrafficFlowResult> {
             @Override
             public void write(TrafficFlowResult value, Context ctx) {
                 int histCount = histStore.getObservationCount(value.h3_12(), value.directionBucket());
-                System.out.printf("[SINK] H3: %s | Ø-Live: %5.1f km/h | Baseline: %5.1f km/h (of %d Measurements) | Index: %5.2f | Status: %s%n",
+                System.out.printf("[FLINK 2.0 SINK] H3: %s | Ø-Live: %5.1f km/h | Baseline: %5.1f km/h (from %d obs) | Index: %5.2f | Status: %s%n",
                         value.h3_12(), value.avgSpeed(), value.baselineSpeed(), histCount, value.congestionIndex(), value.trafficState());
                 store.updateState(value);
             }

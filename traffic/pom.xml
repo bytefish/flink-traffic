@@ -16,11 +16,11 @@
     </modules>
 
     <properties>
-        <java.version>17</java.version>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
+        <java.version>21</java.version>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
         <spring-boot.version>3.2.3</spring-boot.version>
-        <flink.version>2.0.0</flink.version>
+        <flink.version>2.2.0</flink.version>
     </properties>
 
     <dependencyManagement>
