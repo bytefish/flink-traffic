@@ -26,4 +26,4 @@ replay_pid*
 
 # nats-data
 nats-data
-./docker/docker-data
+docker/docker-data
