@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import de.bytefish.traffic.shared.TelemetryEvent;
 import io.nats.client.*;
 import io.nats.client.api.StreamConfiguration;
-import io.nats.client.api.StorageType;
 import io.synadia.flink.message.SourceConverter;
 import io.synadia.flink.source.NatsSource;
 import io.synadia.flink.source.NatsSourceBuilder;
@@ -29,15 +28,9 @@ import reactor.core.publisher.Mono;
 
 import jakarta.annotation.PostConstruct;
 
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.io.Serializable;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
 import java.time.Duration;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -59,16 +52,10 @@ public class TrafficBackendApplication {
         SpringApplication.run(TrafficBackendApplication.class, args);
     }
 
-    // ============================================================================
-    // DATA MODELS
-    // ============================================================================
-    public record TelemetryEvent(String vehicleId, double lat, double lon, String h3_12, double speed, double heading) implements Serializable {}
     public record TrafficFlowResult(String h3_12, String directionBucket, double avgSpeed, double baselineSpeed, double congestionIndex, int vehicleCount, String trafficState) implements Serializable {}
+
     public record RawAggregation(String h3, String direction, double avgSpeed, int count) implements Serializable {}
 
-    // ============================================================================
-    // FLINK COMPONENTS (Public static for reflection/serialization)
-    // ============================================================================
     public static class TelemetrySourceConverter implements SourceConverter<TelemetryEvent> {
         private final ObjectMapper mapper = new ObjectMapper();
         public TelemetrySourceConverter() {}
@@ -143,10 +130,7 @@ public class TrafficBackendApplication {
     }
 }
 
-// ============================================================================
-// SPRING CONFIGURATION
-// ============================================================================
-@org.springframework.context.annotation.Configuration
+@Configuration
 class NatsConfig {
     @Bean
     public Connection natsConnection() throws Exception {
@@ -212,7 +196,7 @@ class TrafficController {
 
     @PostMapping(value = "/telemetry", consumes = MediaType.APPLICATION_JSON_VALUE)
     public Mono<TrafficBackendApplication.TrafficFlowResult> receiveTelemetry(@RequestBody byte[] rawPayload) {
-        return Mono.fromCallable(() -> mapper.readValue(rawPayload, TrafficBackendApplication.TelemetryEvent.class))
+        return Mono.fromCallable(() -> mapper.readValue(rawPayload, TelemetryEvent.class))
                 .flatMap(event -> {
                     historicalStore.observeAndLearnSpeed(event.h3_12(), event.heading(), event.speed());
                     return Mono.fromFuture(js.publishAsync("telemetry.v1", rawPayload))
@@ -236,7 +220,7 @@ class FlinkJobManager {
                 natsProps.setProperty(Options.PROP_SECURE, "true");
                 natsProps.setProperty(Options.PROP_SSL_CONTEXT_FACTORY_CLASS, InsecureSSLFactory.class.getName());
 
-                NatsSource<TrafficBackendApplication.TelemetryEvent> natsSource = new NatsSourceBuilder<TrafficBackendApplication.TelemetryEvent>()
+                NatsSource<TelemetryEvent> natsSource = new NatsSourceBuilder<TelemetryEvent>()
                         .connectionProperties(natsProps)
                         .subjects("telemetry.>")
                         .sourceConverter(new TrafficBackendApplication.TelemetrySourceConverter())

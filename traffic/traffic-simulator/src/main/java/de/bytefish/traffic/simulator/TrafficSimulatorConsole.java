@@ -16,7 +16,7 @@ import java.util.Set;
 
 public class TrafficSimulatorConsole {
 
-    private static final String BACKEND_URL = "http://localhost:8080/api/traffic/telemetry";
+    private static final String BACKEND_URL = "http://localhost:5000/api/traffic/telemetry";
     private static final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
